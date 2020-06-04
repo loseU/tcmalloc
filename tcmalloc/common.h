@@ -131,7 +131,7 @@ inline constexpr size_t kStealAmount = 1 << 16;
 inline constexpr size_t kDefaultProfileSamplingRate = 1 << 21;
 inline constexpr size_t kMinPages = 8;
 #elif TCMALLOC_PAGE_SHIFT == 13
-inline constexpr size_t kPageShift = 13;
+inline constexpr size_t kPageShift = 13;  //用来计算 page 大小的， page 大小 1 << 13 = 8KB
 inline constexpr size_t kNumClasses = 86;
 inline constexpr size_t kMaxSize = 256 * 1024;
 inline constexpr size_t kMinThreadCacheSize = kMaxSize * 2;
@@ -152,7 +152,7 @@ inline constexpr size_t kMinPages = 8;
 inline constexpr size_t kMinObjectsToMove = 2;
 inline constexpr size_t kMaxObjectsToMove = 128;
 
-inline constexpr size_t kPageSize = 1 << kPageShift;
+inline constexpr size_t kPageSize = 1 << kPageShift;  //page 页大小
 // Verify that the page size used is at least 8x smaller than the maximum
 // element size in the thread cache.  This guarantees at most 12.5% internal
 // fragmentation (1/8). When page size is 256k (kPageShift == 18), the benefit
@@ -266,9 +266,22 @@ class SizeMap {
   //   1025       (1025 + 127 + (120<<7)) / 128   129
   //   ...
   //   32768      (32768 + 127 + (120<<7)) / 128  376
+  //   ...
+  //   256*1024   (256*1024 + 127 + (120<<7)) / 128  2168
   static constexpr int kMaxSmallSize = 1024;
   static constexpr size_t kClassArraySize =
       ((kMaxSize + 127 + (120 << 7)) >> 7) + 1;
+
+  //0 - 256K ,范围类的size 输入小内存， 小内存首先会按某字节向上对齐，
+  //tcmalloc 对于 0-256K 范围内 256K + 1 个数字， 对齐后只有 86 种 size（kNumClasses），实际上这 86 种 size 是一个数组，且通过数组索引就可以算出相应的值。
+  //那么 最简单的方法是用 256K+1 这么大的 char 数组来保存相应索引。
+  //但这么做会存在大量冗余信息， 如 1-8 都要重复映射到8，
+  //为了节省这个数组的内存， 就有了上面的算法。
+  //0-1024 这个范围内的 数字， 都是至少8字节对齐（这个要看对齐的算法），那么从1 开始每8个数字，都会对齐到同一个值， 即映射到同一个索引。
+  //1025-256K 这个范围至少是128对齐（这个要看对齐的算法），那么从1025开始每128个数字，都会对齐到同一个值， 映射一个索引即可
+  //这样用 2169 个 char的数组就可以了， 且计算的也方法简单。
+  //只需要将 size 通过上面描述的算法计算即可得到一个索引，这个索引就可以在另外一个数组中取出这个 size 被对齐后的大小。 
+
 
   // Batch size is the number of objects to move at once.
   typedef unsigned char BatchSize;
@@ -277,7 +290,8 @@ class SizeMap {
   // first member so that it inherits the overall alignment of a SizeMap
   // instance.  In particular, if we create a SizeMap instance that's cache-line
   // aligned, this member is also aligned to the width of a cache line.
-  unsigned char class_array_[kClassArraySize];
+  // class_array_ 会被 malloc 调用直接访问， 所以它会被频繁的使用。将它做为类的第一个成员，这样它可以继承类本身的内存对齐。
+  unsigned char class_array_[kClassArraySize]; // 这个数组用来保存 class_to_size_ 的索引， kClassArraySize 可以通过 size 计算得来
 
   // Number of objects to move between a per-thread list and a central
   // list in one shot.  We want this to be not too small so we can
@@ -289,15 +303,19 @@ class SizeMap {
   // If size is no more than kMaxSize, compute index of the
   // class_array[] entry for it, putting the class index in output
   // parameter idx and returning true. Otherwise return false.
+  // 计算 s 大小， 映射到 class_array_ 数组元素的索引
   static inline bool ABSL_ATTRIBUTE_ALWAYS_INLINE ClassIndexMaybe(size_t s,
                                                                   uint32_t* idx) {
+  // 0 - 256K 都属于小内存， 这个方法是计算小内存的映射索引， 即在 class_array_ 中的索引，
+  // class_array_[index] 通用指向一个索引，是 class_to_size_ 的索引， class_to_size_[index] 即是 这个size 对齐后的大小
     if (ABSL_PREDICT_TRUE(s <= kMaxSmallSize)) {
-      *idx = (static_cast<uint32_t>(s) + 7) >> 3;
+      *idx = (static_cast<uint32_t>(s) + 7) >> 3;// 计算 
       return true;
     } else if (s <= kMaxSize) {
       *idx = (static_cast<uint32_t>(s) + 127 + (120 << 7)) >> 7;
       return true;
     }
+    //不是小内存，字节返回false
     return false;
   }
 
@@ -311,7 +329,7 @@ class SizeMap {
   unsigned char class_to_pages_[kNumClasses];
 
   // Mapping from size class to max size storable in that class
-  uint32_t class_to_size_[kNumClasses];
+  uint32_t class_to_size_[kNumClasses]; //这个数组保存 所有小内存 0 - 256K ，对齐后的 size 
 
   // If environment variable defined, use it to override sizes classes.
   // Returns true if all classes defined correctly.
@@ -346,6 +364,9 @@ class SizeMap {
   // class value `kMaxSize'.
   // Important: this function may return true with *cl == 0 if this
   // SizeMap instance has not (yet) been initialized.
+  // 这个方法可能返回true， 且 *cl == 0, 这代表这个SizeMap对象还没初始化， class_to_size_[0] 实际等于 0
+  //
+  // 获取小内存 size， 对齐后的大小在 class_to_size_ 中的索引，保存在 cl中。如果超出小内存范围0-256K,返回 false, 否则返回true
   inline bool ABSL_ATTRIBUTE_ALWAYS_INLINE GetSizeClass(size_t size,
                                                         uint32_t* cl) {
     uint32_t idx;
@@ -361,40 +382,48 @@ class SizeMap {
   // - the size exceeds the maximum size class size.
   // - the align size is greater or equal to the default page size
   // - no matching properly aligned size class is available
+  // 返回参数size 经对齐后的大小
+  // 成功返回true， 失败有以下原因
+  // - size 超过了小内存的范围
+  // - align 比page大或等于page
+  // - 没有合适的对齐size 可用 
   //
-  // Requires that align is a non-zero power of 2.
+  // Requires that align is a non-zero power of 2.要求 align 必须是 2的非零次方
   //
   // Specifying align = 1 will result in this method using the default
   // alignment of the size table. Calling this method with a constexpr
   // value of align = 1 will be optimized by the compiler, and result in
   // the inlined code to be identical to calling `GetSizeClass(size, cl)`
+  // 指定 align = 1将导致， 对齐方式为 tcmalloc 内部定义的对齐方式。
+  // 如果 的调用 这个方法，使用常量1，编译其会优化成 直接调用 GetSizeClass(size, cl)
   inline bool ABSL_ATTRIBUTE_ALWAYS_INLINE GetSizeClass(size_t size,
                                                         size_t align,
                                                         uint32_t* cl) {
     ASSERT(align > 0);
-    ASSERT((align & (align - 1)) == 0);
+    ASSERT((align & (align - 1)) == 0);//align 必须是2的次方
 
-    if (ABSL_PREDICT_FALSE(align >= kPageSize)) {
+    if (ABSL_PREDICT_FALSE(align >= kPageSize)) { //对齐不能等于或超过 page 大小
       return false;
     }
     if (ABSL_PREDICT_FALSE(!GetSizeClass(size, cl))) {
-      return false;
+      return false; //不是小内存返回 false
     }
 
     // Predict that size aligned allocs most often directly map to a proper
     // size class, i.e., multiples of 32, 64, etc, matching our class sizes.
     const size_t mask = (align - 1);
     do {
-      if (ABSL_PREDICT_TRUE((class_to_size(*cl) & mask) == 0)) {
+      if (ABSL_PREDICT_TRUE((class_to_size(*cl) & mask) == 0)) { // 判断当前 cl 索引对应的size 是否满足对齐要求
         return true;
       }
-    } while (++*cl < kNumClasses);
+    } while (++*cl < kNumClasses);//不满足 尝试下一个索引的 size
 
     return false;
   }
 
   // Returns size class for given size, or 0 if this instance has not been
   // initialized yet. REQUIRES: size <= kMaxSize.
+  // 返回 size 对应 class_to_size_ 数组元素的索引
   inline size_t ABSL_ATTRIBUTE_ALWAYS_INLINE SizeClass(size_t size) {
     ASSERT(size <= kMaxSize);
     uint32_t ret = 0;
@@ -403,6 +432,7 @@ class SizeMap {
   }
 
   // Get the byte-size for a specified class. REQUIRES: cl <= kNumClasses.
+  // 获取 class_to_size_ 元素， class_to_size_[cl] 即对齐后的大小
   inline size_t ABSL_ATTRIBUTE_ALWAYS_INLINE class_to_size(size_t cl) {
     ASSERT(cl < kNumClasses);
     return class_to_size_[cl];
